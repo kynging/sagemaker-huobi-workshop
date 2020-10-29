@@ -1,0 +1,245 @@
+#!/usr/bin/env python
+from __future__ import print_function
+
+import datetime
+import json
+import math
+import numpy as np
+import os
+import pandas as pd
+import sys
+import talib as ta
+import traceback
+
+import tensorflow as tf
+from keras.layers import Dropout, Dense
+from keras.wrappers.scikit_learn import KerasClassifier
+from keras.models import Sequential
+from keras.wrappers.scikit_learn import KerasRegressor
+
+
+# Optional
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# These are the paths to where SageMaker mounts interesting things in your container.
+prefix = '/opt/ml/'
+
+config_path = os.path.join(prefix, 'input/config')
+input_path = os.path.join(prefix, 'input/data/training')
+raw_path = os.path.join(input_path, 'data_raw.csv')
+train_path = os.path.join(input_path, 'data_train.csv')
+test_path = os.path.join(input_path, 'data_test.csv')
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+
+
+# Process and prepare the data
+def get_data(params):
+    
+    # get and save hyperparameters
+    long_threshold = float(params['long_threshold'])
+    short_threshold = float(params['short_threshold'])
+    profit_target = float(params['profit_target'])
+    stop_target = float(params['stop_target'])
+
+    repeat_count = int(params['repeat_count'])
+    repeat_step = int(params['repeat_step'])
+    look_back = repeat_count * repeat_step
+    forward_window = int(params['forward_window'])
+    
+    # read data from s3
+    df = pd.read_csv(raw_path, index_col=0)
+    closePrice = df["close"]
+
+    # use talib to calculate SMA and ROC
+    ## set header for transformed data
+    header = ["tradedate", "close"]
+    for i in range(0, repeat_count):
+        header.append("sma" + str((i+1) * repeat_step))
+    for i in range(0, repeat_count):
+        header.append("roc" + str((i+1) * repeat_step))
+    header.append("long")
+    header.append("short")
+
+    data = []
+
+    ## SMA
+    inputs = {'close': np.array(closePrice)}
+    sma = []
+    for i in range(0, repeat_count):
+        sma.append(ta.SMA(np.array(closePrice), timeperiod=(i+1) * repeat_step + 1))
+    ## ROC - Rate of change : ((price/prevPrice)-1)*100
+    roc = []
+    for i in range(0, repeat_count):
+        roc.append(ta.ROC(np.array(closePrice), timeperiod=(i+1) * repeat_step + 1))
+
+    ## count long and short
+    long_count = 0
+    short_count = 0
+    n_count = 0
+    n = 0
+    for idx in df.index:
+        if n < len(df) - forward_window - 1:
+            idx_0 = idx
+            close_price = df.loc[idx, 'close']
+            temp = []
+            temp.append(idx)
+
+            temp2 = []
+            temp2.append(close_price)
+
+            # sma
+            for i in range(0, repeat_count):
+                if np.isnan(sma[i][n]):
+                    temp2.append(close_price)
+                else:
+                    temp2.append(sma[i][n])
+
+            min_value = min(temp2)
+            max_value = max(temp2)
+            for i in temp2:
+                if max_value == min_value:
+                    temp.append(0)
+                else:
+                    temp.append((i - min_value) / (max_value - min_value))
+
+            for i in range(0, repeat_count):
+                if np.isnan(roc[i][n]):
+                    temp.append(0)
+                else:
+                    temp.append(roc[i][n])
+
+            rClose = closePrice[(n+1):min(len(df)-1, n+1+forward_window)].values.tolist()
+            min_value = min(rClose)
+            max_value = max(rClose)
+
+            # long condition
+            if max_value >= close_price * (1+profit_target) and min_value >= close_price * (1-stop_target):
+                long_count += 1
+                temp.append(1)
+            else:
+                temp.append(0)
+
+            # short condition
+            if min_value <= close_price * (1-stop_target) and max_value <= close_price * (1+profit_target):
+                short_count += 1
+                temp.append(1)
+            else:
+                temp.append(0)
+
+            data.append(temp)
+            n += 1
+
+    print("long：%s, short：%s" % (long_count,short_count))
+    df2 = pd.DataFrame(data, columns=header)
+    df2.set_index('tradedate', inplace=True)
+    print('Range:', df2.index[0], '-', df2.index[-1])
+    
+    # save data
+    df_train = df2.iloc[:800]
+    print('Training set:', df_train.index[0], '-', df_train.index[-1])
+    print('Location:', train_path)
+    df_train.to_csv(train_path)
+
+    df_test = df2.iloc[800:1000]
+    print('Testing set:', df_test.index[0], '-', df_test.index[-1])
+    print('Location:', test_path)
+    df_test.to_csv(test_path)
+
+
+def data_process(df, yLen, b):
+    
+    dataX = []
+    dataY = []
+    for idx, row in df.iterrows():
+        row1 = []
+        r = row[1:len(row)-yLen]
+        for a in r:
+            row1.append(a)
+        x = np.array(row1, dtype=float)
+        y = np.array(row[len(row)-yLen:], dtype=float)
+        b = len(x)
+        dataX.append(x)
+        dataY.append(y)
+        
+    dataX = np.array(dataX)
+    dataY = np.array(dataY)
+    
+    return dataX, dataY, b
+
+
+def build_classifier(b, yLen):
+    
+    print("build_classifier:b=%s,yLen=%s" % (b, yLen))
+    model = Sequential()
+    model.add(Dense(b, input_dim=b, kernel_initializer='normal', activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(int(b/2), kernel_initializer='normal', activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(yLen,kernel_initializer='normal', activation='sigmoid'))
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    
+    return model
+
+
+def generate_model(dataX, dataY, b, yLen):
+    
+    model = build_classifier(b, yLen)
+    model.fit(dataX, dataY, epochs=100, batch_size=1)
+    scores = model.evaluate(dataX, dataY, verbose=0)
+    print("Training Data %s: %.2f%%" % (model.metrics_names[1], scores[1]*100))
+    
+    return model
+
+
+def train():
+    
+    try:
+        with open("{}/hyperparameters.json".format(config_path)) as json_file:
+            params = json.load(json_file)
+        print('Parameter load success')
+    except Exception as e:
+        print(e)
+
+    get_data(params)
+    
+    print('Starting the training.')
+    
+    yLen = 2
+    b = 0
+    
+    try:
+        
+        df = pd.read_csv(train_path)
+        dataX, dataY, b = data_process(df, yLen, b)
+        print('b:', b, 'yLen:', yLen)
+        model = generate_model(dataX, dataY, b, yLen)
+        model.save(os.path.join(model_path, 'model.h5'))
+        
+        print('Training is complete. Model saved.')
+        
+        df = pd.read_csv(test_path)
+        dataX, dataY, b = data_process(df, yLen, b)
+        print('b:', b, 'yLen:', yLen)
+        scores = model.evaluate(dataX, dataY, verbose=0)
+        print("Test Data %s: %.2f%%" % (model.metrics_names[1], scores[1]*100))
+        
+    except Exception as e:
+        # Write out an error file. This will be returned as the failure
+        # Reason in the DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs
+        print(
+            'Exception during training: ' + str(e) + '\n' + trc,
+            file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+        
+if __name__ == '__main__':
+    train()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
